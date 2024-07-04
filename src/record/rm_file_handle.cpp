@@ -20,8 +20,14 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
-
-    return nullptr;
+    // std::cout<<"get_record"<<std::endl;
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    char* slot = page_handle.get_slot(rid.slot_no);
+    // for(int i = 0; i < file_hdr_.record_size; i++) {
+    //     printf("%d", slot[i]);
+    // }std::cout<<'\n'<<std::endl;
+    std::unique_ptr<RmRecord> record(new RmRecord(page_handle.file_hdr->record_size, slot));
+    return record;
 }
 
 /**
@@ -37,8 +43,27 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     // 3. 将buf复制到空闲slot位置
     // 4. 更新page_handle.page_hdr中的数据结构
     // 注意考虑插入一条记录后页面已满的情况，需要更新file_hdr_.first_free_page_no
-
-    return Rid{-1, -1};
+    // std::cout<<"insert_record"<<std::endl;
+    RmPageHandle page_handle = create_page_handle();
+    int slot_no = Bitmap::first_bit(0, page_handle.bitmap, file_hdr_.num_records_per_page);
+    // std::cout<<"num_records_per_page: "<<file_hdr_.num_records_per_page<<std::endl;
+    // std::cout<<"num records: "<<page_handle.page_hdr->num_records<<std::endl;
+    // std::cout<<"page no "<<page_handle.page->get_page_id().page_no<<std::endl;
+    // std::cout<<"next free page no: "<<page_handle.page_hdr->next_free_page_no<<std::endl;
+    if (slot_no != file_hdr_.num_records_per_page) {
+        // std::cout<<"slot_no: "<<slot_no<<std::endl;
+        char* slot = page_handle.get_slot(slot_no);
+        memcpy(slot, buf, file_hdr_.record_size);
+        Bitmap::set(page_handle.bitmap, slot_no);
+        page_handle.page_hdr->num_records++;
+        if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
+            // std::cout<<"page full"<<std::endl;
+            file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+        }
+        // std::cout<<"first free page no: "<<file_hdr_.first_free_page_no<<std::endl;
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
+    return Rid{page_handle.page->get_page_id().page_no, slot_no};
 }
 
 /**
@@ -47,7 +72,21 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
  * @param {char*} buf 要插入记录的数据
  */
 void RmFileHandle::insert_record(const Rid& rid, char* buf) {
-    
+    // std::cout<<"insert_record Rid"<<std::endl;
+    if (rid.page_no < file_hdr_.num_pages) {
+        create_new_page_handle();
+    }
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    char* slot = page_handle.get_slot(rid.slot_no);
+    memcpy(slot, buf, file_hdr_.record_size);
+    if (!Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        Bitmap::set(page_handle.bitmap, rid.slot_no);
+        page_handle.page_hdr->num_records++;
+    }
+    if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page) {
+        file_hdr_.first_free_page_no = page_handle.page_hdr->next_free_page_no;
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 /**
@@ -60,6 +99,15 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     // 1. 获取指定记录所在的page handle
     // 2. 更新page_handle.page_hdr中的数据结构
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
+    // std::cout<<"delete_record"<<std::endl;
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    if (Bitmap::is_set(page_handle.bitmap, rid.slot_no)) {
+        Bitmap::reset(page_handle.bitmap, rid.slot_no);
+        page_handle.page_hdr->num_records--;
+        if (page_handle.page_hdr->num_records == file_hdr_.num_records_per_page - 1)
+            release_page_handle(page_handle);
+    }
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 
@@ -73,7 +121,11 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     // Todo:
     // 1. 获取指定记录所在的page handle
     // 2. 更新记录
-
+    // std::cout<<"update_record"<<std::endl;
+    RmPageHandle page_handle = fetch_page_handle(rid.page_no);
+    char* slot = page_handle.get_slot(rid.slot_no);
+    memcpy(slot, buf, file_hdr_.record_size);
+    buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), true);
 }
 
 /**
@@ -88,8 +140,14 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
     // Todo:
     // 使用缓冲池获取指定页面，并生成page_handle返回给上层
     // if page_no is invalid, throw PageNotExistError exception
-
-    return RmPageHandle(&file_hdr_, nullptr);
+    // std::cout<<"fetch_page_handle"<<std::endl;
+    PageId page_id = PageId{.fd = fd_, .page_no = page_no};
+    Page* page = buffer_pool_manager_->fetch_page(page_id);
+    if (page == nullptr) {
+        throw PageNotExistError("a_table_name", page_no);
+    }
+    RmPageHandle page_handle(&file_hdr_, page);
+    return page_handle;
 }
 
 /**
@@ -101,8 +159,18 @@ RmPageHandle RmFileHandle::create_new_page_handle() {
     // 1.使用缓冲池来创建一个新page
     // 2.更新page handle中的相关信息
     // 3.更新file_hdr_
-
-    return RmPageHandle(&file_hdr_, nullptr);
+    // std::cout<<"create_new_page_handle"<<std::endl;
+    PageId page_id = PageId{.fd = fd_, .page_no = INVALID_PAGE_ID};
+    Page* page = buffer_pool_manager_->new_page(&page_id);
+    RmPageHandle page_handle(&file_hdr_, page);
+    page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+    page_handle.page_hdr->num_records = 0;
+    file_hdr_.first_free_page_no = page_id.page_no;
+    file_hdr_.num_pages++;
+    // std::cout<<"num pages: "<<file_hdr_.num_pages<<std::endl;
+    // std::cout<<"page no: "<<file_hdr_.first_free_page_no<<std::endl;
+    // std::cout<<"next free page no: "<<page_handle.page_hdr->next_free_page_no<<std::endl;
+    return page_handle;
 }
 
 /**
@@ -118,7 +186,15 @@ RmPageHandle RmFileHandle::create_page_handle() {
     //     1.2 有空闲页：直接获取第一个空闲页
     // 2. 生成page handle并返回给上层
 
-    return RmPageHandle(&file_hdr_, nullptr);
+    if (file_hdr_.first_free_page_no == RM_NO_PAGE) {
+        RmPageHandle page_handle = create_new_page_handle();
+        // buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        return page_handle;
+    } else {
+        RmPageHandle page_handle = fetch_page_handle(file_hdr_.first_free_page_no);
+        // buffer_pool_manager_->unpin_page(page_handle.page->get_page_id(), false);
+        return page_handle;
+    }
 }
 
 /**
@@ -130,4 +206,8 @@ void RmFileHandle::release_page_handle(RmPageHandle&page_handle) {
     // 1. page_handle.page_hdr->next_free_page_no
     // 2. file_hdr_.first_free_page_no
     
+    if (page_handle.page_hdr->num_records < file_hdr_.num_records_per_page) {
+        page_handle.page_hdr->next_free_page_no = file_hdr_.first_free_page_no;
+        file_hdr_.first_free_page_no = page_handle.page->get_page_id().page_no;
+    }
 }
